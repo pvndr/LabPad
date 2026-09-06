@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { supabase } from "./lib/supabase";
 
 // ─── LABPAD ───────────────────────────────────────────────
 // Offline-first code & notes stash for lab exams
@@ -69,24 +70,72 @@ export default function LabPad() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(n));
   };
 
-  // ── Mock Sync (replace with Supabase) ──
+  // ── Sync (Supabase) ──
   const syncToCloud = useCallback(async () => {
     if (!roomCode || !isOnline) { setSyncStatus("offline"); return; }
     setSyncStatus("syncing");
     try {
-      // 🔌 TODO: Replace this with Supabase:
-      // const { data } = await supabase.from('notes').select('*').eq('room', roomCode)
-      // merge local + remote, upsert changed ones
-      await new Promise(r => setTimeout(r, 1200)); // mock delay
+      const currentNotes = JSON.parse(localStorage.getItem(STORAGE_KEY)) || [];
+      const { data: remoteNotes, error: fetchError } = await supabase
+        .from('notes')
+        .select('*')
+        .eq('room', roomCode);
+
+      if (fetchError) throw fetchError;
+
+      const remoteNotesMap = new Map((remoteNotes || []).map(n => [n.id, n]));
+      
+      let mergedNotes = [];
+      let notesToUpsert = [];
+
+      for (const localNote of currentNotes) {
+        const remoteNote = remoteNotesMap.get(localNote.id);
+        if (remoteNote) {
+          if (new Date(localNote.updatedAt) > new Date(remoteNote.updatedAt)) {
+            notesToUpsert.push({ ...localNote, room: roomCode });
+            mergedNotes.push(localNote);
+          } else {
+            mergedNotes.push(remoteNote);
+          }
+          remoteNotesMap.delete(localNote.id);
+        } else {
+          notesToUpsert.push({ ...localNote, room: roomCode });
+          mergedNotes.push(localNote);
+        }
+      }
+
+      for (const remoteNote of remoteNotesMap.values()) {
+        mergedNotes.push(remoteNote);
+      }
+
+      if (notesToUpsert.length > 0) {
+        const { error: upsertError } = await supabase
+          .from('notes')
+          .upsert(notesToUpsert);
+        if (upsertError) throw upsertError;
+      }
+
+      mergedNotes = mergedNotes.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+      setNotes(mergedNotes);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(mergedNotes));
+
       const now = new Date().toISOString();
       setLastSync(now);
       localStorage.setItem(SYNC_KEY, now);
       setSyncStatus("synced");
       showToast("Synced ✓");
-    } catch {
+    } catch (err) {
+      console.error(err);
       setSyncStatus("error");
     }
   }, [roomCode, isOnline]);
+
+  // ── Auto Sync ──
+  useEffect(() => {
+    if (roomCode && isOnline) {
+      syncToCloud();
+    }
+  }, [roomCode, isOnline, syncToCloud]);
 
   // ── Room setup ──
   const enterRoom = () => {
@@ -132,10 +181,19 @@ export default function LabPad() {
     if (isOnline) syncToCloud();
   }, [selected, editTitle, editContent, editSubject, notes, isOnline]);
 
-  const deleteNote = () => {
-    persistNotes(notes.filter(n => n.id !== selected.id));
+  const deleteNote = async () => {
+    const noteIdToDelete = selected.id;
+    persistNotes(notes.filter(n => n.id !== noteIdToDelete));
     setScreen("home");
     showToast("Note deleted");
+
+    if (isOnline && roomCode) {
+      try {
+        await supabase.from('notes').delete().eq('id', noteIdToDelete).eq('room', roomCode);
+      } catch (err) {
+        console.error("Failed to delete from cloud:", err);
+      }
+    }
   };
 
   const copyContent = () => {
